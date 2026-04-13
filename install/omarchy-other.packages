@@ -53,6 +53,8 @@ wget
 yay-debug
 tuxedo-drivers-nocompatcheck-dkms
 yt6801-dkms
+zfs-dkms
+zfs-utils
 zram-generator
 
 # Vulkan drivers (auto-detected by hardware)

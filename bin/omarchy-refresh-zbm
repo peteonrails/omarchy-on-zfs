@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Rebuild initramfs and regenerate ZFSBootMenu if available.
+
+echo "Rebuilding initramfs"
+sudo mkinitcpio -P
+
+if command -v generate-zbm &>/dev/null; then
+  echo "Regenerating ZFSBootMenu"
+  sudo generate-zbm
+fi

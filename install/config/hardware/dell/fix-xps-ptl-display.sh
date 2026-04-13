@@ -6,16 +6,5 @@ if omarchy-hw-match "XPS" \
 
   echo "Detected Dell XPS with LG OLED panel on Panther Lake, applying display power-saving fix..."
 
-  CMDLINE='KERNEL_CMDLINE[default]+=" xe.enable_psr=0 xe.enable_panel_replay=0"'
-
-  sudo mkdir -p /etc/limine-entry-tool.d
-  cat <<EOF | sudo tee /etc/limine-entry-tool.d/dell-xps-ptl-display.conf >/dev/null
-# Fix Dell XPS OLED display issues by disabling Xe PSR and Panel Replay power-saving features
-$CMDLINE
-EOF
-
-  # Also append to /etc/default/limine if it exists, since it overrides drop-in configs
-  if [ -f /etc/default/limine ] && ! grep -q 'xe.enable_psr' /etc/default/limine; then
-    echo "$CMDLINE" | sudo tee -a /etc/default/limine >/dev/null
-  fi
+  omarchy-cmdline-add "xe.enable_psr=0 xe.enable_panel_replay=0" dell-xps-ptl-display
 fi

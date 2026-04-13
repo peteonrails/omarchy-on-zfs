@@ -1,4 +1,83 @@
-if command -v limine &>/dev/null; then
+if omarchy-fs-zfs; then
+  # ZFS boot environment setup -- ZBM is managed by the user externally
+  sudo tee /etc/mkinitcpio.conf.d/omarchy_hooks.conf <<EOF >/dev/null
+HOOKS=(base udev plymouth keyboard autodetect microcode modconf kms keymap consolefont block zfs filesystems fsck)
+EOF
+
+  sudo tee /etc/mkinitcpio.conf.d/thunderbolt_module.conf <<EOF >/dev/null
+MODULES+=(thunderbolt)
+EOF
+
+  # Configure this dataset as a ZBM boot environment
+  DATASET=$(zfs list -H -o name /)
+  POOL=$(echo "$DATASET" | cut -d/ -f1)
+
+  # Set mountpoint=/ and canmount=noauto so ZBM discovers this as a boot environment
+  sudo zfs set mountpoint=/ "$DATASET"
+  sudo zfs set canmount=noauto "$DATASET"
+
+  # Set kernel cmdline if not already set (inherit from pool if possible)
+  CURRENT_CMDLINE=$(zfs get -H -o value org.zfsbootmenu:commandline "$DATASET" 2>/dev/null)
+  if [[ $CURRENT_CMDLINE == "-" || -z $CURRENT_CMDLINE ]]; then
+    sudo zfs set "org.zfsbootmenu:commandline=quiet splash rw" "$DATASET"
+  fi
+
+  # Ensure zpool cachefile is set so initramfs can import the pool without probing
+  if [[ ! -s /etc/zfs/zpool.cache ]]; then
+    sudo mkdir -p /etc/zfs
+    sudo zpool set cachefile=/etc/zfs/zpool.cache "$POOL"
+  fi
+
+  # Set up zfs-mount-generator: creates systemd mount units from a cache file
+  # that zfs-zed keeps in sync with dataset properties. This is the modern
+  # alternative to zfs-mount.service's `zfs mount -a` approach and integrates
+  # cleanly with systemd's boot sequence.
+  sudo mkdir -p /etc/zfs/zfs-list.cache
+  if [[ ! -f /etc/zfs/zfs-list.cache/$POOL ]]; then
+    # Seed the cache with current dataset properties. zfs-zed will keep it
+    # updated going forward via the history_event-zfs-list-cacher.sh hook.
+    ZFS_CACHE_PROPS="name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand,encroot,keylocation,org.openzfs.systemd:requires,org.openzfs.systemd:requires-mounts-for,org.openzfs.systemd:before,org.openzfs.systemd:after,org.openzfs.systemd:wanted-by,org.openzfs.systemd:required-by,org.openzfs.systemd:nofail,org.openzfs.systemd:ignore"
+    sudo zfs list -H -t filesystem -o "$ZFS_CACHE_PROPS" -r "$POOL" | sort | sudo tee "/etc/zfs/zfs-list.cache/$POOL" >/dev/null
+  fi
+
+  # Enable zfs-zed so dataset property changes keep the cache file current
+  chrootable_systemctl_enable zfs-zed.service
+
+  # Install omarchy ZBM branding hooks (Tokyo Night menu theme + branded
+  # passphrase prompt). These only take effect once ZBM is rebuilt via
+  # `generate-zbm`, which we run below if the tool is available.
+  sudo mkdir -p /etc/zfsbootmenu/hooks/setup.d /etc/zfsbootmenu/hooks/load-key.d
+  sudo install -m 755 "$OMARCHY_PATH/default/zfsbootmenu/hooks/setup.d/01-omarchy-theme.sh" /etc/zfsbootmenu/hooks/setup.d/
+  sudo install -m 755 "$OMARCHY_PATH/default/zfsbootmenu/hooks/load-key.d/01-omarchy-unlock.sh" /etc/zfsbootmenu/hooks/load-key.d/
+
+  # Embed the encryption key in the initramfs (via FILES=) so the initramfs can
+  # unlock the pool without double-prompting. The key file lives in the keysource
+  # dataset which has the same encryption root, so it's accessible once the pool
+  # has been unlocked by ZBM. FILES= copies its contents into the initramfs image.
+  ENCROOT=$(zfs get -H -o value encryptionroot "$DATASET" 2>/dev/null)
+  if [[ $ENCROOT != "-" ]]; then
+    KEYLOC=$(zfs get -H -o value keylocation "$ENCROOT" 2>/dev/null)
+    if [[ $KEYLOC == file://* ]]; then
+      KEYFILE="${KEYLOC#file://}"
+      if [[ -r $KEYFILE ]]; then
+        echo "Embedding encryption key in initramfs: $KEYFILE"
+        sudo tee /etc/mkinitcpio.conf.d/omarchy_zfs_keys.conf >/dev/null <<EOF
+FILES+=($KEYFILE)
+EOF
+      fi
+
+      # Sync the user's login password with the ZFS encryption passphrase
+      # so they only need to remember one password (mirrors btrfs/LUKS behavior)
+      KEYFORMAT=$(zfs get -H -o value keyformat "$ENCROOT" 2>/dev/null)
+      if [[ -z ${OMARCHY_CHROOT_INSTALL:-} && -r $KEYFILE && $KEYFORMAT == "passphrase" ]]; then
+        echo "Syncing user password with ZFS encryption passphrase"
+        ZFS_PASS=$(sudo cat "$KEYFILE")
+        echo "$USER:$ZFS_PASS" | sudo chpasswd
+      fi
+    fi
+  fi
+
+elif command -v limine &>/dev/null; then
   sudo pacman -S --noconfirm --needed limine-snapper-sync limine-mkinitcpio-hook
 
   sudo tee /etc/mkinitcpio.conf.d/omarchy_hooks.conf <<EOF >/dev/null
@@ -87,17 +166,27 @@ fi
 
 echo "mkinitcpio hooks re-enabled"
 
-sudo limine-update
+if omarchy-fs-zfs; then
+  # Rebuild initramfs for ZFS
+  sudo mkinitcpio -P
 
-# Verify that limine-update actually added boot entries
-if ! grep -q "^/+" /boot/limine.conf; then
-  echo "Error: limine-update failed to add boot entries to /boot/limine.conf" >&2
-  exit 1
-fi
+  # Regenerate ZBM if available (user may manage it externally)
+  if command -v generate-zbm &>/dev/null; then
+    sudo generate-zbm
+  fi
+else
+  sudo limine-update
 
-if [[ -n $EFI ]] && efibootmgr &>/dev/null; then
-  # Remove the archinstall-created Limine entry
-  while IFS= read -r bootnum; do
-    sudo efibootmgr -b "$bootnum" -B >/dev/null 2>&1
-  done < <(efibootmgr | grep -E "^Boot[0-9]{4}\*? Arch Linux Limine" | sed 's/^Boot\([0-9]\{4\}\).*/\1/')
+  # Verify that limine-update actually added boot entries
+  if ! grep -q "^/+" /boot/limine.conf; then
+    echo "Error: limine-update failed to add boot entries to /boot/limine.conf" >&2
+    exit 1
+  fi
+
+  if [[ -n $EFI ]] && efibootmgr &>/dev/null; then
+    # Remove the archinstall-created Limine entry
+    while IFS= read -r bootnum; do
+      sudo efibootmgr -b "$bootnum" -B >/dev/null 2>&1
+    done < <(efibootmgr | grep -E "^Boot[0-9]{4}\*? Arch Linux Limine" | sed 's/^Boot\([0-9]\{4\}\).*/\1/')
+  fi
 fi

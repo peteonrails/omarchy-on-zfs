@@ -66,6 +66,52 @@ FILES+=($KEYFILE)
 EOF
       fi
 
+      # Fix zfs-mount-generator dependency cycle on the keystore dataset.
+      #
+      # When the pool's key file lives inside a dataset on the same pool
+      # (e.g., rpool/keystore mounted at /etc/zfs/keys holds rpool.key),
+      # zfs-mount-generator creates a mount unit with:
+      #   After=zfs-load-key@rpool.service
+      #   BindsTo=zfs-load-key@rpool.service
+      #
+      # But zfs-load-key@rpool.service has RequiresMountsFor=/etc/zfs/keys/rpool.key,
+      # which adds After=etc-zfs-keys.mount — creating a cycle.
+      #
+      # Since the key is embedded in the initramfs (above), zfs-load-key@rpool
+      # is a no-op at userspace. Ship a static mount unit that drops the
+      # circular dependency. Drop-ins can't reset After=/BindsTo=, so we
+      # replace the generated unit entirely.
+      KEYDIR=$(dirname "$KEYFILE")
+      KEYSTORE_DS=$(zfs list -H -o name,mountpoint -r "$POOL" 2>/dev/null | awk -v mp="$KEYDIR" '$2 == mp {print $1}')
+      if [[ -n $KEYSTORE_DS ]]; then
+        MOUNT_UNIT_NAME=$(systemd-escape --path "$KEYDIR").mount
+        echo "Installing static mount unit for $KEYSTORE_DS to break generator cycle"
+        sudo tee "/etc/systemd/system/$MOUNT_UNIT_NAME" >/dev/null <<UNIT
+# Static override for $KEYSTORE_DS — breaks the zfs-mount-generator
+# dependency cycle between this mount and zfs-load-key@${POOL}.service.
+# The pool key is loaded from initramfs, so the load-key dep is not needed.
+
+[Unit]
+Description=Mount $KEYSTORE_DS at $KEYDIR
+Documentation=man:zfs-mount-generator(8)
+DefaultDependencies=no
+Before=local-fs.target
+After=zfs-import.target
+RequiresMountsFor=$(dirname "$KEYDIR")
+
+[Mount]
+Where=$KEYDIR
+What=$KEYSTORE_DS
+Type=zfs
+Options=defaults,atime,relatime,nodev,exec,rw,suid,nomand,zfsutil
+
+[Install]
+WantedBy=local-fs.target
+UNIT
+        sudo systemctl daemon-reload
+        chrootable_systemctl_enable "$MOUNT_UNIT_NAME"
+      fi
+
       # Sync the user's login password with the ZFS encryption passphrase
       # so they only need to remember one password (mirrors btrfs/LUKS behavior)
       KEYFORMAT=$(zfs get -H -o value keyformat "$ENCROOT" 2>/dev/null)

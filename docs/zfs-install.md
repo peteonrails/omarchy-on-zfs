@@ -475,16 +475,48 @@ Either way, both BEs show up in ZBM's menu at boot.
 
 ### Merging homes later
 
-If you decide to merge `/home` across BEs (share media, dotfiles, etc.):
+Once Omarchy is your primary OS, you'll likely want to merge to a shared
+`rpool/home` so all your data (media, dotfiles, project directories) is
+in one place rather than split across per-BE home datasets.
 
-1. Copy `rpool/omarchy/home/<user>` contents into `rpool/home/<user>`
-2. Delete or rename `rpool/omarchy/home`
-3. Remove the `/home` fstab entry on Omarchy
-4. Clear the ignore property: `zfs inherit org.openzfs.systemd:ignore rpool/home`
-5. Re-enable `zfs-mount.service` on Omarchy
+**The merge direction matters:** overlay the smaller per-BE home onto the
+larger shared home, not the other way around. The per-BE home has the
+Omarchy-managed configs (hyprland, waybar, alacritty, etc.) that should
+win; the shared home has your data volume.
 
-Consider a dotfile manager (chezmoi, stow) to keep OS-specific configs
-layered on a shared home.
+```
+# 1. Snapshot both sides first (safety net)
+sudo zfs snapshot rpool/home@pre-merge-$(date +%Y%m%d)
+sudo zfs snapshot rpool/omarchy/home@pre-merge-$(date +%Y%m%d)
+
+# 2. Mount the shared home somewhere temporary
+sudo mkdir -p /mnt/shared-home
+sudo mount -t zfs -o zfsutil rpool/home /mnt/shared-home
+
+# 3. Overlay per-BE configs onto the shared home (preview first)
+rsync -av --dry-run --exclude='.cache' /home/$USER/ /mnt/shared-home/$USER/
+# If the preview looks right:
+rsync -av --exclude='.cache' /home/$USER/ /mnt/shared-home/$USER/
+
+# 4. Swap the mounts: make rpool/home the active /home
+sudo zfs set canmount=on rpool/home
+sudo zfs set mountpoint=/home rpool/home
+sudo zfs set canmount=noauto rpool/omarchy/home
+
+# 5. Update fstab: replace rpool/omarchy/home with rpool/home
+#    rpool/omarchy/home  /home  zfs  ...   →
+#    rpool/home          /home  zfs  defaults,zfsutil  0 0
+
+# 6. Clean up
+sudo umount /mnt/shared-home && sudo rmdir /mnt/shared-home
+```
+
+The per-BE home dataset (`rpool/omarchy/home`) stays around as a rollback
+option. Don't delete it until you're confident the merge is solid.
+
+**Do NOT re-enable `zfs-mount.service`** — Omarchy uses `zfs-mount-generator`
+for mounts. The `rpool/home` dataset's `canmount=on` property is enough
+for the generator to create a mount unit for it automatically.
 
 ---
 
@@ -527,6 +559,152 @@ EFI:
 
 ---
 
+## Appendix C: Backup and replication with syncoid
+
+One of ZFS's strongest features is `zfs send`/`zfs recv` — block-level
+incremental replication of datasets. **syncoid** (from the sanoid package)
+wraps this in a single command with bookmark tracking.
+
+### Why replicate
+
+Snapshots protect against accidental changes, but they live on the same
+pool as your data. If the pool is lost (disk failure, accidental
+`zpool destroy`), the snapshots go with it. Replication copies snapshots
+to a second pool — a different disk, a NAS, a remote server — so you
+have an independent copy.
+
+### Install syncoid
+
+syncoid ships as part of the sanoid package:
+
+```
+omarchy-pkg-aur-add sanoid
+```
+
+### Local replication (second pool on the same machine)
+
+If you have a backup pool (e.g., `zbackup`), replicate your important
+datasets to it:
+
+```
+# First run is a full send (may take a while)
+syncoid --recursive --no-sync-snap rpool/omarchy/root zbackup/omarchy/root
+
+# rpool/home: use --create-bookmark for incremental tracking
+syncoid --recursive --create-bookmark rpool/home zbackup/home
+```
+
+Subsequent runs are incremental — only changed blocks are sent.
+
+### Automating with a systemd timer
+
+Create a service and timer to run replication daily:
+
+```
+# /etc/systemd/system/syncoid.service
+[Unit]
+Description=Replicate ZFS datasets to backup pool
+After=zfs.target
+
+[Service]
+Type=oneshot
+ExecStart=syncoid --recursive --no-sync-snap --create-bookmark rpool/omarchy/root zbackup/omarchy/root
+ExecStart=syncoid --recursive --create-bookmark rpool/home zbackup/home
+```
+
+```
+# /etc/systemd/system/syncoid.timer
+[Unit]
+Description=Daily ZFS replication
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+```
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now syncoid.timer
+```
+
+### Remote replication (push to a NAS or server)
+
+syncoid supports SSH natively:
+
+```
+syncoid --recursive rpool/home user@nas:zbackup/home
+```
+
+The remote side needs ZFS and the receiving user needs permission to
+create datasets. For encrypted datasets, add `--sendoptions=w` to send
+raw encrypted blocks (the remote can't read your data).
+
+### What to replicate
+
+| Dataset | Replicate? | Why |
+|---------|-----------|-----|
+| `rpool/omarchy/root` | Yes | System state, packages, configs |
+| `rpool/home` | Yes | User data — the most important dataset |
+| `rpool/keystore` | Yes | Encryption keys for the pool |
+| `rpool/omarchy/home` | No (if merged) | Transient per-BE home; rpool/home is authoritative after merge |
+| `rpool/omarchy/varcache` | No | Pacman cache, easily re-downloaded |
+| `rpool/omarchy/varlog` | Optional | Logs; useful for incident forensics |
+| `rpool/models` | No | Large, easily re-downloaded (Ollama models, etc.) |
+
+### Encrypted replication
+
+With ZFS native encryption, `syncoid --sendoptions=w` sends raw encrypted
+blocks. The receiving pool stores the data encrypted with your key — it
+cannot decrypt without your passphrase. This is safe for untrusted backup
+targets.
+
+---
+
+## Appendix D: Home dataset strategy
+
+ZFS's per-dataset mount control gives you a choice that btrfs doesn't:
+whether `/home` is shared across boot environments or isolated per-BE.
+
+### Per-BE home (the default)
+
+The standard Omarchy layout creates `rpool/omarchy/home` mounted at
+`/home`. This is fully isolated — each BE has its own home directory.
+
+**Good for:**
+- Testing Omarchy alongside another OS without cross-contamination
+- Clean separation of desktop environments (different hyprland configs, etc.)
+- Fresh installs where you don't have existing data
+
+**Downside:** Your data (documents, projects, media) is trapped inside the
+BE. If you create a new BE, you start with an empty home.
+
+### Shared home
+
+A shared `rpool/home` dataset with `canmount=on` auto-mounts on every BE.
+All boot environments see the same `/home`.
+
+**Good for:**
+- Single-OS setups (Omarchy is your only OS)
+- Preserving data across BE swaps and system rollbacks
+- Avoiding duplicate data when you have hundreds of GB in your home dir
+
+**Downside:** A system rollback doesn't roll back your home directory.
+Desktop configs (hyprland, waybar, etc.) that changed between snapshots
+won't revert. This is usually what you want, but be aware of it.
+
+### Recommendation
+
+Start with the per-BE home for initial testing. Once Omarchy is your
+primary OS, merge to a shared `rpool/home` — see
+[Merging homes later](#merging-homes-later) in Appendix A for the
+procedure.
+
+---
+
 ## Troubleshooting
 
 **Double passphrase prompt at boot**
@@ -552,6 +730,36 @@ environment. Verify with `zfs get mountpoint rpool/omarchy/root`.
 **`/home` mounts the wrong dataset (dual-boot)**
 See [Appendix A](#appendix-a-dual-boot-alongside-an-existing-zfs-os) for
 the `org.openzfs.systemd:ignore` + disable `zfs-mount.service` setup.
+
+**Keystore dataset won't mount (dependency cycle)**
+If you see `Found ordering cycle` in the journal involving
+`etc-zfs-keys.mount` and `zfs-load-key@rpool.service`, the
+zfs-mount-generator is creating a circular dependency. The installer
+should have shipped a static mount unit to break this cycle. If it
+didn't, create one manually:
+
+```
+sudo tee /etc/systemd/system/etc-zfs-keys.mount >/dev/null <<EOF
+[Unit]
+Description=Mount rpool/keystore at /etc/zfs/keys
+DefaultDependencies=no
+Before=local-fs.target
+After=zfs-import.target
+RequiresMountsFor=/etc
+
+[Mount]
+Where=/etc/zfs/keys
+What=rpool/keystore
+Type=zfs
+Options=defaults,atime,relatime,nodev,exec,rw,suid,nomand,zfsutil
+
+[Install]
+WantedBy=local-fs.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now etc-zfs-keys.mount
+```
 
 **`Error: snapper configs not found` during install**
 Ignore -- that's the btrfs code path. The Omarchy installer should skip

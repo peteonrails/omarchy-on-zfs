@@ -57,6 +57,10 @@ zfs-dkms
 zfs-utils
 zram-generator
 
+# Intel encoding processing
+libvpl
+vpl-gpu-rt
+
 # Vulkan drivers (auto-detected by hardware)
 vulkan-intel
 vulkan-radeon

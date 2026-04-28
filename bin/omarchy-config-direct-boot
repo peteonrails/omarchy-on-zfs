@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Add an EFI boot entry for the Omarchy UKI, allowing the system to boot directly
+# Add or remove an EFI boot entry for the Omarchy UKI, allowing the system to boot directly
 # without a bootloader like Limine. Requires UEFI firmware and a built UKI.
 
 if [[ ! -d /sys/firmware/efi ]]; then
@@ -23,8 +23,18 @@ if cat /sys/class/dmi/id/bios_vendor 2>/dev/null | grep -qi "Apple"; then
   exit 1
 fi
 
-if omarchy-fs-zfs; then
-  # Find ZBM EFI image
+existing_entry=$(efibootmgr | grep -E "^Boot[0-9A-Fa-f]+\*? Omarchy([[:space:]]|$)" | head -1)
+
+if [[ -n $existing_entry ]]; then
+  boot_num=$(echo "$existing_entry" | sed -n 's/^Boot\([0-9A-Fa-f]\+\).*/\1/p')
+
+  if gum confirm "Disable direct boot (remove Omarchy EFI entry)?"; then
+    echo "Removing EFI boot entry $boot_num"
+    sudo efibootmgr --bootnum "$boot_num" --delete-bootnum >/dev/null
+  fi
+
+  exit 0
+elif omarchy-fs-zfs; then
   efi_file=$(find /boot/efi/EFI/zbm/ /boot/EFI/zbm/ -name "*.EFI" -printf "%f\n" 2>/dev/null | head -1)
 
   if [[ -z $efi_file ]]; then

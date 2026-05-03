@@ -1,14 +1,26 @@
 #!/bin/bash
 
-# Creates a swap file in the btrfs subvolume, adds the swap file to /etc/fstab,
-# adds a resume hook to mkinitcpio, and configures suspend-then-hibernate.
+# omarchy:summary=Set up hibernation with swap and boot resume configuration
+# omarchy:requires-sudo=true
+# omarchy:args=[--force] [--no-rebuild]
+
+FORCE=false
+NO_REBUILD=false
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    --no-rebuild) NO_REBUILD=true ;;
+  esac
+done
 
 if [[ ! -f /sys/power/image_size ]]; then
   echo -e "Hibernation is not supported on your system" >&2
   exit 0
 fi
 
-if ! omarchy-fs-zfs && ! command -v limine-mkinitcpio &>/dev/null; then
+# When --no-rebuild is set, the caller is responsible for the UKI rebuild.
+# ZFS systems don't need limine-mkinitcpio at all (they rebuild via mkinitcpio + generate-zbm).
+if ! omarchy-fs-zfs && ! $NO_REBUILD && ! command -v limine-mkinitcpio &>/dev/null; then
   echo "Skipping hibernation setup (requires Limine bootloader)"
   exit 0
 fi
@@ -19,22 +31,21 @@ RESUME_DROP_IN="/etc/limine-entry-tool.d/resume.conf"
 
 # Check if hibernation is already configured
 if [[ -f $MKINITCPIO_CONF ]] && grep -q "^HOOKS+=(resume)$" "$MKINITCPIO_CONF"; then
-  # Fix empty resume_offset if btrfs map-swapfile failed during initial setup
-  if [[ -f $RESUME_DROP_IN ]] && grep -q 'resume_offset="$' "$RESUME_DROP_IN" && [[ -f $SWAP_FILE ]]; then
+  # Fix empty resume_offset if btrfs map-swapfile failed during initial setup (Btrfs only — zvol has no offset)
+  if ! omarchy-fs-zfs && [[ -f $RESUME_DROP_IN ]] && grep -q 'resume_offset="$' "$RESUME_DROP_IN" && [[ -f $SWAP_FILE ]]; then
     RESUME_OFFSET=$(sudo btrfs inspect-internal map-swapfile -r "$SWAP_FILE" 2>/dev/null)
     if [[ -n $RESUME_OFFSET ]]; then
       echo "Fixing empty resume_offset ($RESUME_OFFSET)"
       sudo sed -i "s/resume_offset=\"$/resume_offset=$RESUME_OFFSET\"/" "$RESUME_DROP_IN"
       sudo sed -i "s/resume_offset=\"$/resume_offset=$RESUME_OFFSET\"/" /etc/default/limine
-      sudo limine-mkinitcpio
-      sudo limine-update
+      $NO_REBUILD || sudo limine-mkinitcpio
     fi
   fi
   echo "Hibernation is already set up"
   exit 0
 fi
 
-if [[ $1 != "--force" ]]; then
+if ! $FORCE; then
   MEM_TOTAL_HUMAN=$(free --human | awk '/Mem/ {print $2}')
   if ! gum confirm "Use $MEM_TOTAL_HUMAN on boot drive to make hibernation available?"; then
     exit 0
@@ -97,17 +108,8 @@ if omarchy-fs-zfs; then
     omarchy-cmdline-add "rtc_cmos.use_acpi_alarm=1" rtc-alarm
   fi
 
-  # Regenerate initramfs
-  echo "Regenerating initramfs..."
-  sudo mkinitcpio -P
-
-  if command -v generate-zbm &>/dev/null; then
-    sudo generate-zbm
-  fi
-
 else
   SWAP_SUBVOLUME="/swap"
-  SWAP_FILE="$SWAP_SUBVOLUME/swapfile"
 
   # Create btrfs subvolume for swap
   if ! sudo btrfs subvolume show "$SWAP_SUBVOLUME" &>/dev/null; then
@@ -146,7 +148,6 @@ else
 
   # Add resume= kernel parameters so the initramfs resume hook knows where to find the
   # hibernation image. Without these, resume happens late (after GPU drivers load) and fails.
-  RESUME_DROP_IN="/etc/limine-entry-tool.d/resume.conf"
   if [[ ! -f $RESUME_DROP_IN ]]; then
     echo "Adding resume kernel parameters"
     sudo swapon -p 0 "$SWAP_FILE" 2>/dev/null
@@ -171,15 +172,25 @@ else
       sudo tee -a /etc/default/limine < "$LIMINE_DROP_IN" >/dev/null
     fi
   fi
-
-  # Regenerate initramfs and boot entry
-  echo "Regenerating initramfs..."
-  sudo limine-mkinitcpio
-  sudo limine-update
 fi
 
-echo
+if ! $NO_REBUILD; then
+  echo "Regenerating initramfs..."
+  if omarchy-fs-zfs; then
+    sudo mkinitcpio -P
+    if command -v generate-zbm &>/dev/null; then
+      sudo generate-zbm
+    fi
+  else
+    # limine-mkinitcpio rebuilds initramfs/UKI for all kernels and updates the
+    # /boot/limine.conf entries via limine-entry-tool. The limine bootloader
+    # binary on the ESP doesn't change here, so we don't need limine-update
+    # (which would also re-deploy the binary and rebuild a second time).
+    sudo limine-mkinitcpio
+    echo
+  fi
+fi
 
-if [[ $1 != "--force" ]] && gum confirm "Reboot to enable hibernation?"; then
+if ! $FORCE && ! $NO_REBUILD && gum confirm "Reboot to enable hibernation?"; then
   omarchy-system-reboot
 fi

@@ -88,6 +88,38 @@ the right answer, not as a general upgrade.
 
 ---
 
+## Two paths: scripted or manual
+
+There are two ways to get to a working Omarchy-on-ZFS install:
+
+### Scripted (recommended)
+
+From an Arch Linux live ISO, as root with a working network:
+
+```
+curl -fsSL https://raw.githubusercontent.com/peteonrails/omarchy-on-zfs/omarchy-zfs/bootstrap/iso-zfs.sh | bash
+```
+
+This runs `bin/omarchy-bootstrap-zfs`, which performs every step in this
+document end-to-end: adds the archzfs repo, installs ZFS on the ISO,
+partitions the disk(s), creates the pool, lays out datasets, pacstraps
+the base system, configures the chroot, installs ZFSBootMenu, registers
+the EFI boot entry, and hands off to `install.sh`.
+
+It supports single-disk, mirror, raidz1/2/3, fresh-pool *or* import of an
+existing pool (Appendix A dual-boot), and per-BE *or* shared `/home`.
+
+Use `--dry-run` to preview every command without changing anything, or
+`--resume` to pick back up after a failure.
+
+### Manual
+
+The rest of this document is the manual procedure the script automates.
+Use it if you want fine-grained control, are debugging the script, or
+need a configuration the v1 script doesn't cover (e.g. ESP mirroring
+across all pool members, custom dataset names, multi-vdev pools with
+special/log/cache devices).
+
 ## Prerequisites
 
 Before running the Omarchy installer, you need:

@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Rebuild initramfs and regenerate ZFSBootMenu if available.
+# omarchy:summary=Rebuild initramfs and regenerate ZFSBootMenu if available.
+# omarchy:requires-sudo=true
 
 echo "Rebuilding initramfs"
 sudo mkinitcpio -P

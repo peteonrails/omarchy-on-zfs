@@ -1,10 +1,11 @@
 #!/bin/bash
 
-# Add kernel command line parameters in a bootloader-agnostic way.
+# omarchy:summary=Add kernel command line parameters in a bootloader-agnostic way.
+# omarchy:args=<param> [drop-in-name]
+# omarchy:requires-sudo=true
+#
 # On btrfs/Limine: writes to /etc/limine-entry-tool.d/ and appends to /etc/default/limine.
 # On ZFS/ZBM: sets the org.zfsbootmenu:commandline property on the root dataset.
-#
-# Usage: omarchy-cmdline-add <param> [drop-in-name]
 # Example: omarchy-cmdline-add "intel_iommu=on iommu=pt" t2-mac
 
 PARAM="$1"

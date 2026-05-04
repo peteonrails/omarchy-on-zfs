@@ -1,7 +1,17 @@
 #!/bin/bash
 
-# omarchy:summary=Restart an application by killing it and relaunching via uwsm.
+# omarchy:summary=Restart an application by stopping its systemd user scope and relaunching via uwsm.
 # omarchy:args=<application-name> [application-args...]
+#
+# Stopping the scope (rather than pkill on the binary) ensures any child
+# processes — e.g. waybar's exec-module helpers like omarchy-voxtype-status,
+# which spawn a long-lived `voxtype status --follow` — receive SIGTERM from
+# systemd and can run their cleanup traps. pkill alone only kills the
+# named binary and leaves orphan children behind, which in turn keep the
+# scope alive and cause scopes to accumulate across restarts.
 
-pkill -x $1
+# Hyphens in the binary name are escaped to \x2d in systemd unit names
+# (e.g. swayosd-server → swayosd\x2dserver), so escape before matching.
+escaped=$(systemd-escape "$1")
+systemctl --user stop "app-*-${escaped}-*.scope" 2>/dev/null
 setsid uwsm-app -- "$@" >/dev/null 2>&1 &

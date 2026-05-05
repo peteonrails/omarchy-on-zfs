@@ -1,25 +1,28 @@
-# Install + enable the monthly btrfs scrub timer on btrfs systems.
-# No-op on ZFS (the parallel zfs-scrub-timer.sh covers that).
+# Enable monthly btrfs scrub on root using btrfs-progs's btrfs-scrub@.timer
+# template (already shipped by stock Arch — no fork-shipped units needed).
+# No-op on ZFS systems.
+#
+# Idempotent: also cleans up the hand-rolled units shipped in v3.7.1-zfs.3
+# if they're still present from an earlier update.
 
 if ! omarchy-fs-btrfs; then
   return 0 2>/dev/null || exit 0
 fi
 
-# Symlink the scrub helper into /usr/local/bin so the .service unit can
-# reference an absolute, system-wide path that survives an omarchy-update.
-sudo install -d /usr/local/bin
-sudo ln -sf "$OMARCHY_PATH/bin/omarchy-btrfs-scrub" /usr/local/bin/omarchy-btrfs-scrub
+# Cleanup leftovers from v3.7.1-zfs.3's hand-rolled approach (no-op if absent)
+if [[ -f /etc/systemd/system/omarchy-btrfs-scrub.timer ]]; then
+  sudo systemctl disable --now omarchy-btrfs-scrub.timer 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/omarchy-btrfs-scrub.service \
+             /etc/systemd/system/omarchy-btrfs-scrub.timer
+  sudo rm -f /usr/local/bin/omarchy-btrfs-scrub
+  sudo systemctl daemon-reload
+fi
 
-# Install the systemd units
-sudo install -m 644 "$OMARCHY_PATH/default/systemd/system/omarchy-btrfs-scrub.service" \
-  /etc/systemd/system/omarchy-btrfs-scrub.service
-sudo install -m 644 "$OMARCHY_PATH/default/systemd/system/omarchy-btrfs-scrub.timer" \
-  /etc/systemd/system/omarchy-btrfs-scrub.timer
-
-# Enable + start (running system) or just enable (chroot during install).
+# Enable the upstream-shipped template for "/" (the "-" instance is
+# systemd-escape for the "/" mountpoint).
 if [[ -d /run/systemd/system ]]; then
   sudo systemctl daemon-reload
-  sudo systemctl enable --now omarchy-btrfs-scrub.timer
+  sudo systemctl enable --now btrfs-scrub@-.timer
 else
-  sudo systemctl enable omarchy-btrfs-scrub.timer
+  sudo systemctl enable btrfs-scrub@-.timer
 fi

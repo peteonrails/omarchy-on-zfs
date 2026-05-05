@@ -31,6 +31,8 @@ run_logged $OMARCHY_INSTALL/config/wifi-powersave-rules.sh
 run_logged $OMARCHY_INSTALL/config/plocate-ac-only.sh
 run_logged $OMARCHY_INSTALL/config/zfs-archzfs-repo.sh
 run_logged $OMARCHY_INSTALL/config/zfs-kernel-guard.sh
+run_logged $OMARCHY_INSTALL/config/zfs-scrub-timer.sh
+run_logged $OMARCHY_INSTALL/config/btrfs-scrub-timer.sh
 
 run_logged $OMARCHY_INSTALL/config/hardware/network.sh
 run_logged $OMARCHY_INSTALL/config/hardware/set-wireless-regdom.sh

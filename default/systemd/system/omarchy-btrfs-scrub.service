@@ -1,0 +1,10 @@
+[Unit]
+Description=Btrfs scrub on all mounted btrfs filesystems
+Documentation=man:btrfs-scrub(8)
+ConditionPathExists=/sys/fs/btrfs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/omarchy-btrfs-scrub
+StandardOutput=journal
+StandardError=journal

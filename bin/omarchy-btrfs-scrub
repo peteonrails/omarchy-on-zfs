@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# omarchy:summary=Run btrfs scrub on every mounted btrfs filesystem.
+# omarchy:requires-sudo=true
+#
+# Designed to be invoked by omarchy-btrfs-scrub.service (monthly timer) but
+# also safe to run by hand. `btrfs scrub start` (without -B) kicks off the
+# scrub and returns immediately — the scrub itself runs in the kernel for
+# hours via the [btrfs-scrub] kthread. We dedupe by UUID so multiple subvols
+# of the same filesystem don't trigger multiple scrubs (one scrub covers the
+# whole underlying btrfs FS), and skip filesystems that already have a scrub
+# running.
+
+set -e
+
+if ! command -v btrfs &>/dev/null; then
+  echo "omarchy-btrfs-scrub: btrfs command not found, skipping" >&2
+  exit 0
+fi
+
+# Pick one mount per unique btrfs filesystem (by UUID)
+mapfile -t mounts < <(findmnt -t btrfs -no UUID,TARGET 2>/dev/null | sort -u -k1,1 | awk '{print $2}')
+
+if (( ${#mounts[@]} == 0 )); then
+  echo "omarchy-btrfs-scrub: no btrfs mounts, nothing to do"
+  exit 0
+fi
+
+for mp in "${mounts[@]}"; do
+  if btrfs scrub status "$mp" 2>/dev/null | grep -qE '^Status:[[:space:]]+running'; then
+    echo "omarchy-btrfs-scrub: scrub already running on $mp, skipping"
+    continue
+  fi
+  echo "omarchy-btrfs-scrub: starting scrub on $mp"
+  btrfs scrub start "$mp"
+done

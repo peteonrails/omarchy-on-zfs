@@ -5,12 +5,15 @@
 
 set -e
 
-# Bootstrap the ZFS kernel guard (alpm hook + symlink + IgnorePkg) on every
-# update so it's in place BEFORE the pacman transaction can upgrade the kernel.
-# This is idempotent: if the hook is already installed, this is a no-op.
-# No-op on btrfs systems.
+# Bootstrap ZFS-related guards BEFORE the pacman transaction:
+#   - archzfs repo (so zfs-dkms / zfs-utils have a current source)
+#   - kernel compatibility guard (alpm hook + IgnorePkg)
+# Both are idempotent — no-op if already in place. No-op on btrfs systems.
 if command -v omarchy-fs-zfs &>/dev/null && omarchy-fs-zfs; then
-  if [[ -x $OMARCHY_PATH/install/config/zfs-kernel-guard.sh ]]; then
+  if [[ -f $OMARCHY_PATH/install/config/zfs-archzfs-repo.sh ]]; then
+    bash "$OMARCHY_PATH/install/config/zfs-archzfs-repo.sh" || true
+  fi
+  if [[ -f $OMARCHY_PATH/install/config/zfs-kernel-guard.sh ]]; then
     bash "$OMARCHY_PATH/install/config/zfs-kernel-guard.sh" || true
   fi
 fi

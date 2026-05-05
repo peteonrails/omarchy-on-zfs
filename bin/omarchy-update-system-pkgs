@@ -16,6 +16,13 @@ if command -v omarchy-fs-zfs &>/dev/null && omarchy-fs-zfs; then
   if [[ -f $OMARCHY_PATH/install/config/zfs-kernel-guard.sh ]]; then
     bash "$OMARCHY_PATH/install/config/zfs-kernel-guard.sh" || true
   fi
+
+  # Pre-update safety net: a ZFS snapshot of the BE so a failed update
+  # can be rolled back. Upstream's omarchy-snapshot exits 127 on ZFS
+  # (no snapper), so we take the snapshot ourselves here.
+  if command -v omarchy-zfs-snapshot &>/dev/null; then
+    omarchy-zfs-snapshot create || true
+  fi
 fi
 
 echo -e "\e[32m\nUpdate system packages\e[0m"

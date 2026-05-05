@@ -206,6 +206,9 @@ fi
 echo "mkinitcpio hooks re-enabled"
 
 if omarchy-fs-zfs; then
+  # Defensive: refuse to rebuild if zfs-dkms can't build for the installed kernel.
+  omarchy-zfs-kernel-compat-check installed || exit 1
+
   # Rebuild initramfs for ZFS
   sudo mkinitcpio -P
 

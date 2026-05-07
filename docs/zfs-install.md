@@ -106,8 +106,10 @@ partitions the disk(s), creates the pool, lays out datasets, pacstraps
 the base system, configures the chroot, installs ZFSBootMenu, registers
 the EFI boot entry, and hands off to `install.sh`.
 
-It supports single-disk, mirror, raidz1/2/3, fresh-pool *or* import of an
-existing pool (Appendix A dual-boot), and per-BE *or* shared `/home`.
+It supports single-disk, mirror, raidz1/2/3, and fresh-pool *or* import
+of an existing pool (Appendix A dual-boot). Home is shared at
+`zroot/data/home` by default — per-BE home isolation is no longer a
+default option (it was rarely the right call for desktop installs).
 
 Use `--dry-run` to preview every command without changing anything, or
 `--resume` to pick back up after a failure.
@@ -182,8 +184,8 @@ You'll be prompted for an encryption passphrase during pool creation.
 Remember it -- it unlocks your system at boot.
 
 Pool name is `zroot` (Arch wiki convention). Older fork installs used
-`rpool` (the FreeBSD heritage name); both work — runtime tooling
-discovers the pool name dynamically. New installs default to `zroot`.
+`rpool` (FreeBSD heritage); both work — runtime tooling discovers the
+pool name dynamically. New installs default to `zroot`.
 
 ## Step 2: Create the dataset layout
 
@@ -241,10 +243,10 @@ aren't affected. That means:
 
 ```
 mkdir -p /mnt
-zfs mount rpool/omarchy/root        # mounts at /mnt if it's your altroot, else /
-zfs mount rpool/omarchy/varcache
-zfs mount rpool/omarchy/varlog
-zfs mount rpool/omarchy/home
+zfs mount zroot/ROOT/default        # mounts at /mnt if it's your altroot, else /
+zfs mount zroot/var/cache
+zfs mount zroot/var/log
+zfs mount zroot/data/home
 
 # Mount ESP
 mkdir -p /mnt/boot/efi
@@ -343,16 +345,16 @@ ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 cat >> /etc/fstab <<EOF
 
 # ZFS boot-environment datasets (canmount=noauto, explicit mount)
-rpool/omarchy/varcache  /var/cache  zfs  defaults,zfsutil  0 0
-rpool/omarchy/varlog    /var/log    zfs  defaults,zfsutil  0 0
-rpool/omarchy/home      /home       zfs  defaults,zfsutil  0 0
+zroot/var/cache  /var/cache  zfs  defaults,zfsutil  0 0
+zroot/var/log    /var/log    zfs  defaults,zfsutil  0 0
+zroot/data/home      /home       zfs  defaults,zfsutil  0 0
 EOF
 ```
 
 ### 4e. Set the zpool cachefile
 
 ```
-zpool set cachefile=/etc/zfs/zpool.cache rpool
+zpool set cachefile=/etc/zfs/zpool.cache zroot
 ```
 
 This lets the initramfs import the pool on boot without scanning.
@@ -403,7 +405,7 @@ ZBM reads the per-dataset `org.zfsbootmenu:commandline` property to know
 what to pass to the kernel when booting this BE:
 
 ```
-zfs set org.zfsbootmenu:commandline='quiet splash rw' rpool/omarchy/root
+zfs set org.zfsbootmenu:commandline='quiet splash rw' zroot/ROOT/default
 ```
 
 ## Step 7: Run the Omarchy installer
@@ -438,7 +440,7 @@ You should see:
 
 1. **ZBM** prompt for the encryption passphrase (once -- the initramfs
    uses the embedded key for the re-import)
-2. ZBM displays your boot environments (`rpool/omarchy/root` is the only
+2. ZBM displays your boot environments (`zroot/ROOT/default` is the only
    one for a fresh install)
 3. Select it and the system boots
 4. SDDM auto-login for the user
@@ -474,41 +476,54 @@ on a ZFS pool that's already running another OS (e.g., CachyOS, Ubuntu).
 The same pool, different root dataset.
 
 Omarchy's Step 2 dataset layout works as-is -- the container dataset
-`rpool/omarchy` is separate from whatever your other OS uses
-(`rpool/cachyos`, `rpool/ubuntu`, etc.).
+`zroot` is separate from whatever your other OS uses
+(`zroot/cachyos`, `zroot/ubuntu`, etc.).
 
 ### Isolation concerns
 
-Both OSes share the same pool, so shared datasets like `rpool/home`
+Both OSes share the same pool, so shared datasets like `zroot/home`
 (mountpoint=/home, canmount=on) will auto-mount on both. That's usually
 not what you want for initial testing -- it means Omarchy's hyprland
 configs would leak into your other OS's home, or vice versa.
 
-For fully isolated testing:
+For fully isolated testing, swap the shared `zroot/data/home` for a
+per-BE home dataset:
 
-**1. Use a per-BE home dataset** (already in Step 2 above if you followed
-Omarchy's layout).
-
-**2. Tell `zfs-mount-generator` to skip `rpool/home` on Omarchy:**
+**1. Create a per-BE home dataset** with `canmount=noauto` so it doesn't
+auto-mount on the other OS:
 
 ```
-zfs set org.openzfs.systemd:ignore=on rpool/home
+zfs create -o mountpoint=/home -o canmount=noauto zroot/data/omarchy-home
+```
+
+**2. Tell `zfs-mount-generator` to skip the shared `zroot/data/home`** on
+Omarchy:
+
+```
+zfs set org.openzfs.systemd:ignore=on zroot/data/home
 ```
 
 This property only affects `zfs-mount-generator`. The other OS is
 unaffected if it uses `zfs-mount.service` instead.
 
-**3. Disable `zfs-mount.service` on Omarchy:**
+**3. Disable `zfs-mount.service` on Omarchy** so it doesn't pull in
+the shared home:
 
 ```
 systemctl disable zfs-mount.service
 ```
 
 Why: `zfs-mount.service` runs `zfs mount -a` which mounts every
-`canmount=on` dataset, including `rpool/home`. It does NOT respect the
-`org.openzfs.systemd:ignore` property. With it disabled, Omarchy relies
-entirely on `zfs-mount-generator` + fstab for mounts. The generator
-handles shared datasets like `rpool/keystore`, `rpool/models`, etc.
+`canmount=on` dataset, including the shared `zroot/data/home`. It does
+NOT respect the `org.openzfs.systemd:ignore` property. With it disabled,
+Omarchy relies entirely on `zfs-mount-generator` for mounts. The
+generator handles shared datasets like `zroot/keystore` correctly.
+
+**4. Add an fstab entry** for the per-BE home so it mounts on this BE:
+
+```
+echo "zroot/data/omarchy-home  /home  zfs  defaults,zfsutil  0 0" | sudo tee -a /etc/fstab
+```
 
 ### Cross-OS property visibility
 
@@ -523,58 +538,43 @@ ZBM's default boot is controlled by the pool's `bootfs` property:
 
 ```
 # Keep the other OS as default:
-zpool set bootfs=rpool/cachyos/root rpool
+zpool set bootfs=zroot/cachyos/root zroot
 
 # Or make Omarchy default:
-zpool set bootfs=rpool/omarchy/root rpool
+zpool set bootfs=zroot/ROOT/default zroot
 ```
 
 Either way, both BEs show up in ZBM's menu at boot.
 
-### Merging homes later
+### Switching from per-BE home back to shared
 
-Once Omarchy is your primary OS, you'll likely want to merge to a shared
-`rpool/home` so all your data (media, dotfiles, project directories) is
-in one place rather than split across per-BE home datasets.
-
-**The merge direction matters:** overlay the smaller per-BE home onto the
-larger shared home, not the other way around. The per-BE home has the
-Omarchy-managed configs (hyprland, waybar, alacritty, etc.) that should
-win; the shared home has your data volume.
+If you started with the per-BE home isolation above and want to merge
+back to a shared `zroot/data/home`:
 
 ```
 # 1. Snapshot both sides first (safety net)
-sudo zfs snapshot rpool/home@pre-merge-$(date +%Y%m%d)
-sudo zfs snapshot rpool/omarchy/home@pre-merge-$(date +%Y%m%d)
+sudo zfs snapshot zroot/data/home@pre-merge-$(date +%Y%m%d)
+sudo zfs snapshot zroot/data/omarchy-home@pre-merge-$(date +%Y%m%d)
 
 # 2. Mount the shared home somewhere temporary
 sudo mkdir -p /mnt/shared-home
-sudo mount -t zfs -o zfsutil rpool/home /mnt/shared-home
+sudo mount -t zfs -o zfsutil zroot/data/home /mnt/shared-home
 
 # 3. Overlay per-BE configs onto the shared home (preview first)
 rsync -av --dry-run --exclude='.cache' /home/$USER/ /mnt/shared-home/$USER/
 # If the preview looks right:
 rsync -av --exclude='.cache' /home/$USER/ /mnt/shared-home/$USER/
 
-# 4. Swap the mounts: make rpool/home the active /home
-sudo zfs set canmount=on rpool/home
-sudo zfs set mountpoint=/home rpool/home
-sudo zfs set canmount=noauto rpool/omarchy/home
+# 4. Drop the per-BE home from fstab and re-enable shared:
+sudo sed -i '/zroot\/data\/omarchy-home/d' /etc/fstab
+sudo zfs set org.openzfs.systemd:ignore=off zroot/data/home
 
-# 5. Update fstab: replace rpool/omarchy/home with rpool/home
-#    rpool/omarchy/home  /home  zfs  ...   →
-#    rpool/home          /home  zfs  defaults,zfsutil  0 0
-
-# 6. Clean up
+# 5. Clean up
 sudo umount /mnt/shared-home && sudo rmdir /mnt/shared-home
 ```
 
-The per-BE home dataset (`rpool/omarchy/home`) stays around as a rollback
-option. Don't delete it until you're confident the merge is solid.
-
-**Do NOT re-enable `zfs-mount.service`** — Omarchy uses `zfs-mount-generator`
-for mounts. The `rpool/home` dataset's `canmount=on` property is enough
-for the generator to create a mount unit for it automatically.
+The per-BE dataset stays around as rollback. Don't delete it until
+you're confident the merge is solid.
 
 ---
 
@@ -646,10 +646,10 @@ datasets to it:
 
 ```
 # First run is a full send (may take a while)
-syncoid --recursive --no-sync-snap rpool/omarchy/root zbackup/omarchy/root
+syncoid --recursive --no-sync-snap zroot/ROOT/default zbackup/omarchy/root
 
-# rpool/home: use --create-bookmark for incremental tracking
-syncoid --recursive --create-bookmark rpool/home zbackup/home
+# zroot/home: use --create-bookmark for incremental tracking
+syncoid --recursive --create-bookmark zroot/home zbackup/home
 ```
 
 Subsequent runs are incremental — only changed blocks are sent.
@@ -666,8 +666,8 @@ After=zfs.target
 
 [Service]
 Type=oneshot
-ExecStart=syncoid --recursive --no-sync-snap --create-bookmark rpool/omarchy/root zbackup/omarchy/root
-ExecStart=syncoid --recursive --create-bookmark rpool/home zbackup/home
+ExecStart=syncoid --recursive --no-sync-snap --create-bookmark zroot/ROOT/default zbackup/omarchy/root
+ExecStart=syncoid --recursive --create-bookmark zroot/home zbackup/home
 ```
 
 ```
@@ -694,7 +694,7 @@ sudo systemctl enable --now syncoid.timer
 syncoid supports SSH natively:
 
 ```
-syncoid --recursive rpool/home user@nas:zbackup/home
+syncoid --recursive zroot/home user@nas:zbackup/home
 ```
 
 The remote side needs ZFS and the receiving user needs permission to
@@ -705,13 +705,16 @@ raw encrypted blocks (the remote can't read your data).
 
 | Dataset | Replicate? | Why |
 |---------|-----------|-----|
-| `rpool/omarchy/root` | Yes | System state, packages, configs |
-| `rpool/home` | Yes | User data — the most important dataset |
-| `rpool/keystore` | Yes | Encryption keys for the pool |
-| `rpool/omarchy/home` | No (if merged) | Transient per-BE home; rpool/home is authoritative after merge |
-| `rpool/omarchy/varcache` | No | Pacman cache, easily re-downloaded |
-| `rpool/omarchy/varlog` | Optional | Logs; useful for incident forensics |
-| `rpool/models` | No | Large, easily re-downloaded (Ollama models, etc.) |
+| `zroot/ROOT/default` | Yes | System state, packages, configs |
+| `zroot/data/home` | Yes | User data — the most important dataset |
+| `zroot/data/root` | Yes | Root user's home (sudoers config edits, etc.) |
+| `zroot/keystore` | Yes | Encryption keys for the pool |
+| `zroot/var/log` | Optional | Logs; useful for incident forensics |
+| `zroot/var/cache` | No | Pacman cache, easily re-downloaded |
+| `zroot/var/tmp` | No | Transient by definition |
+| `zroot/var/lib/docker` | Depends | Container state — replicate if you have running services with persistent volumes |
+| `zroot/var/lib/libvirt` | Yes | VM disk images (large but irreplaceable) |
+| `zroot/var/lib/machines` | Optional | systemd-nspawn containers |
 
 ### Encrypted replication
 
@@ -727,26 +730,13 @@ targets.
 ZFS's per-dataset mount control gives you a choice that btrfs doesn't:
 whether `/home` is shared across boot environments or isolated per-BE.
 
-### Per-BE home (the default)
+### Shared home (the default)
 
-The standard Omarchy layout creates `rpool/omarchy/home` mounted at
-`/home`. This is fully isolated — each BE has its own home directory.
-
-**Good for:**
-- Testing Omarchy alongside another OS without cross-contamination
-- Clean separation of desktop environments (different hyprland configs, etc.)
-- Fresh installs where you don't have existing data
-
-**Downside:** Your data (documents, projects, media) is trapped inside the
-BE. If you create a new BE, you start with an empty home.
-
-### Shared home
-
-A shared `rpool/home` dataset with `canmount=on` auto-mounts on every BE.
-All boot environments see the same `/home`.
+The fork's bootstrap creates `zroot/data/home` mounted at `/home` and
+shared across all boot environments — all BEs see the same `/home`.
 
 **Good for:**
-- Single-OS setups (Omarchy is your only OS)
+- Single-OS setups (Omarchy is your only OS) — the common case
 - Preserving data across BE swaps and system rollbacks
 - Avoiding duplicate data when you have hundreds of GB in your home dir
 
@@ -754,12 +744,18 @@ All boot environments see the same `/home`.
 Desktop configs (hyprland, waybar, etc.) that changed between snapshots
 won't revert. This is usually what you want, but be aware of it.
 
-### Recommendation
+### Per-BE home (advanced, opt-in)
 
-Start with the per-BE home for initial testing. Once Omarchy is your
-primary OS, merge to a shared `rpool/home` — see
-[Merging homes later](#merging-homes-later) in Appendix A for the
-procedure.
+For dual-boot scenarios where you want config isolation between BEs,
+swap the shared home for a per-BE one. See [Appendix A](#appendix-a-dual-boot-alongside-an-existing-zfs-os)
+for the per-BE setup procedure.
+
+**Good for:**
+- Testing Omarchy alongside another OS without cross-contamination
+- Clean separation of desktop environments (different hyprland configs)
+
+**Downside:** Your data (documents, projects, media) is trapped inside
+the BE. If you create a new BE, you start with an empty home.
 
 ---
 
@@ -768,7 +764,7 @@ procedure.
 **Double passphrase prompt at boot**
 The initramfs key embedding didn't work. Check that
 `/etc/mkinitcpio.conf.d/omarchy_zfs_keys.conf` contains
-`FILES+=(/etc/zfs/keys/rpool.key)` (or your key path), then rebuild:
+`FILES+=(/etc/zfs/keys/zroot.key)` (or your key path), then rebuild:
 `sudo mkinitcpio -P`.
 
 **Ethernet doesn't work after install**
@@ -783,7 +779,7 @@ The pipewire companion packages may be missing. Install them:
 
 **ZBM doesn't see Omarchy in the boot menu**
 Your dataset needs `mountpoint=/` for ZBM to recognize it as a boot
-environment. Verify with `zfs get mountpoint rpool/omarchy/root`.
+environment. Verify with `zfs get mountpoint zroot/ROOT/default`.
 
 **`/home` mounts the wrong dataset (dual-boot)**
 See [Appendix A](#appendix-a-dual-boot-alongside-an-existing-zfs-os) for
@@ -791,7 +787,7 @@ the `org.openzfs.systemd:ignore` + disable `zfs-mount.service` setup.
 
 **Keystore dataset won't mount (dependency cycle)**
 If you see `Found ordering cycle` in the journal involving
-`etc-zfs-keys.mount` and `zfs-load-key@rpool.service`, the
+`etc-zfs-keys.mount` and `zfs-load-key@zroot.service`, the
 zfs-mount-generator is creating a circular dependency. The installer
 should have shipped a static mount unit to break this cycle. If it
 didn't, create one manually:
@@ -799,7 +795,7 @@ didn't, create one manually:
 ```
 sudo tee /etc/systemd/system/etc-zfs-keys.mount >/dev/null <<EOF
 [Unit]
-Description=Mount rpool/keystore at /etc/zfs/keys
+Description=Mount zroot/keystore at /etc/zfs/keys
 DefaultDependencies=no
 Before=local-fs.target
 After=zfs-import.target
@@ -807,7 +803,7 @@ RequiresMountsFor=/etc
 
 [Mount]
 Where=/etc/zfs/keys
-What=rpool/keystore
+What=zroot/keystore
 Type=zfs
 Options=defaults,atime,relatime,nodev,exec,rw,suid,nomand,zfsutil
 

@@ -94,17 +94,23 @@ There are two ways to get to a working Omarchy-on-ZFS install:
 
 ### Scripted (recommended)
 
-From an Arch Linux live ISO, as root with a working network:
+**Boot from `r-maerz/archlinux-lts-zfs`**, not the stock Arch ISO. This is
+an archlinux ISO with the LTS kernel and prebuilt `zfs-linux-lts` modules
+already loaded — kernel and ZFS are version-paired by archzfs's build.
+
+Latest release: <https://github.com/r-maerz/archlinux-lts-zfs/releases>
+(monthly cadence, ~1.5 GB). Burn it or boot in a VM, log in as `root`,
+get networking working, then:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/peteonrails/omarchy-on-zfs/omarchy-zfs/bootstrap/iso-zfs.sh | bash
 ```
 
 This runs `bin/omarchy-bootstrap-zfs`, which performs every step in this
-document end-to-end: adds the archzfs repo, installs ZFS on the ISO,
-partitions the disk(s), creates the pool, lays out datasets, pacstraps
-the base system, configures the chroot, installs ZFSBootMenu, registers
-the EFI boot entry, and hands off to `install.sh`.
+document end-to-end: partitions the disk(s), creates the pool, lays out
+datasets, pacstraps the base system with `linux-lts` + `zfs-linux-lts`,
+configures the chroot, installs ZFSBootMenu, registers the EFI boot
+entry, and hands off to `install.sh`.
 
 It supports single-disk, mirror, raidz1/2/3, and fresh-pool *or* import
 of an existing pool (Appendix A dual-boot). Home is shared at
@@ -113,6 +119,14 @@ default option (it was rarely the right call for desktop installs).
 
 Use `--dry-run` to preview every command without changing anything, or
 `--resume` to pick back up after a failure.
+
+**Why the LTS-zfs ISO instead of stock Arch:** the stock Arch ISO has
+no ZFS modules. We used to build `zfs-dkms-git` from a pinned OpenZFS
+commit at install time to compensate, but that traded freshness — the
+installed system was frozen on the build commit. Booting an archzfs-
+equipped ISO eliminates that trap: kernel and ZFS modules are paired
+by archzfs at release time, and `pacman -Syu` afterward keeps them
+paired automatically. No DKMS rebuilds.
 
 ### Manual
 

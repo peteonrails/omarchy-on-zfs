@@ -1,13 +1,19 @@
 #!/bin/bash
 
-# omarchy:summary=Bootstrap a fresh Omarchy install on ZFS-on-root with ZFSBootMenu (run from Arch live ISO).
+# omarchy:summary=Bootstrap a fresh Omarchy install on ZFS-on-root with ZFSBootMenu (run from the archzfs LTS ISO).
 # omarchy:args=[--dry-run] [--resume]
 # omarchy:requires-sudo=true
 #
-# Runs from an Arch Linux live ISO as root. Performs the Phase 0 work that
-# `omarchy/install.sh` doesn't: partitioning, zpool/dataset creation,
-# pacstrap, chroot config, ZBM install, EFI boot entry. Then hands off to
-# `install.sh` inside the chroot.
+# Runs from r-maerz/archlinux-lts-zfs (https://github.com/r-maerz/archlinux-lts-zfs/releases)
+# — an archlinux ISO with the LTS kernel and prebuilt zfs-linux-lts modules.
+# Performs the Phase 0 work that `omarchy/install.sh` doesn't: partitioning,
+# zpool/dataset creation, pacstrap, chroot config, ZBM install, EFI boot
+# entry. Then hands off to `install.sh` inside the chroot.
+#
+# Why the LTS-zfs ISO instead of stock Arch: kernel and ZFS module versions
+# are atomically paired by archzfs's package release. No DKMS rebuild
+# lottery on `pacman -Syu`, no kernel-ahead-of-zfs-dkms trap that bricked
+# the workstation on 2026-05-04.
 #
 # This is the automated equivalent of docs/zfs-install.md.
 #
@@ -22,9 +28,7 @@
 #   - Encrypted whole-pool with passphrase, file-based key for password sync
 #   - Single ESP on the first member disk (ESP-mirror is a follow-up)
 #   - Arch-wiki-style dataset layout: zroot/ROOT/default + zroot/data + zroot/var
-#   - zfs-dkms-git built from a pinned OpenZFS commit (avoids the archzfs
-#     release-lag-vs-kernel trap we hit on kernel 7.x). Override the commit
-#     via OMARCHY_OPENZFS_REF.
+#   - linux-lts kernel + prebuilt zfs-linux-lts (atomic version pairing)
 
 set -euo pipefail
 
@@ -57,18 +61,12 @@ readonly KEYFILE_FINAL="/etc/zfs/keys/${POOL_NAME}.key"
 readonly STATE_FILE="/tmp/omarchy-bootstrap-zfs.state"
 readonly LOG_FILE="/tmp/omarchy-bootstrap-zfs.log"
 
-readonly ARCHZFS_KEY="DDF7DB817396A49B2A2723F7403BD972F75D9D76"
 # Latest stable release EFI, served via redirect by the ZBM project.
 readonly ZBM_RELEASE_URL="https://get.zfsbootmenu.org/efi"
 
-# Pin OpenZFS to a specific master-branch commit when building zfs-dkms-git.
-# Override via OMARCHY_OPENZFS_REF=<sha> if a newer commit is needed before
-# we cut the next bootstrap release. Default commit is on master with
-# Linux-Maximum: 7.0 — avoids the "archzfs release lags new kernel" trap.
-readonly OPENZFS_GIT_REF="${OMARCHY_OPENZFS_REF:-0a59f7845c2863b5370bfa38e4d397ba3d73b62a}"
-readonly ZFS_GIT_BUILD_DIR="/tmp/omarchy-zfs-git-build"
-readonly ZFS_GIT_PKG_DIR="/tmp/omarchy-zfs-git-pkgs"
-readonly ZFS_GIT_BUILD_USER="omarchy-zfs-build"
+# Pointer to the recommended ISO for users who run this from the wrong
+# environment (stock Arch ISO without ZFS modules). Documentation only.
+readonly RECOMMENDED_ISO_URL="https://github.com/r-maerz/archlinux-lts-zfs/releases"
 
 readonly MNT="/mnt"
 readonly ESP_MOUNT="${MNT}/boot/efi"
@@ -173,73 +171,33 @@ stage_preflight() {
 }
 
 # ============================================================================
-# Stage 2: build zfs-dkms-git / zfs-utils-git from a pinned OpenZFS commit
+# Stage 2: verify ZFS is available on the live ISO
 #
-# We pin instead of pulling archzfs's released zfs-dkms because archzfs lags
-# OpenZFS upstream by weeks-to-months — and OpenZFS master may have
-# Linux-Maximum support for kernel versions that the released archzfs
-# package doesn't yet build against. Using the git PKGBUILD with a pinned
-# upstream commit gets us the support we need without depending on the
-# archzfs release cadence.
+# We require the user to boot the archlinux-lts-zfs ISO (r-maerz), which
+# ships with the LTS kernel + prebuilt zfs-linux-lts modules. archzfs
+# guarantees atomic kernel/zfs version pairing, so there's nothing to
+# build here — the modules just need to be loaded.
 #
-# Built packages also get carried into the chroot via stage_pacstrap so the
-# target system has the same versions.
+# If zpool isn't available, we abort with a clear pointer at the right
+# ISO. Building zfs-dkms-git on a stock Arch ISO is technically possible
+# (and what we did before) but it traded freshness for portability;
+# requiring the LTS-zfs ISO is cleaner.
 # ============================================================================
 
 stage_install_zfs_on_iso() {
-  if modinfo zfs &>/dev/null && command -v zpool &>/dev/null; then
-    say "ZFS already available on this ISO"
-    run modprobe zfs
-    return 0
+  if ! modinfo zfs &>/dev/null || ! command -v zpool &>/dev/null; then
+    die "ZFS not available on this ISO.
+
+This bootstrap requires the archlinux-lts-zfs ISO (LTS kernel + prebuilt
+zfs-linux-lts modules) — not the stock Arch live ISO.
+
+Download from: $RECOMMENDED_ISO_URL
+
+Boot that ISO and re-run this script."
   fi
 
-  say "Building zfs-utils-git and zfs-dkms-git from OpenZFS @ $OPENZFS_GIT_REF"
-  say "(this takes ~5–10 min the first time; pinned commit avoids archzfs lag)"
-
-  run pacman -Sy --noconfirm
-  run pacman -S --noconfirm --needed base-devel git linux-headers dkms
-
-  if (( DRY_RUN )); then
-    log "would clone, sed-pin, and makepkg zfs-{utils,dkms}-git"
-    return 0
-  fi
-
-  rm -rf "$ZFS_GIT_BUILD_DIR" "$ZFS_GIT_PKG_DIR"
-  mkdir -p "$ZFS_GIT_BUILD_DIR" "$ZFS_GIT_PKG_DIR"
-
-  if ! id -u "$ZFS_GIT_BUILD_USER" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "$ZFS_GIT_BUILD_USER"
-  fi
-  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$ZFS_GIT_BUILD_USER" \
-    > "/etc/sudoers.d/${ZFS_GIT_BUILD_USER}"
-  chmod 440 "/etc/sudoers.d/${ZFS_GIT_BUILD_USER}"
-  chown -R "${ZFS_GIT_BUILD_USER}:${ZFS_GIT_BUILD_USER}" "$ZFS_GIT_BUILD_DIR"
-
-  for pkg in zfs-utils-git zfs-dkms-git; do
-    sudo -u "$ZFS_GIT_BUILD_USER" git clone --depth 1 \
-      "https://aur.archlinux.org/${pkg}.git" "${ZFS_GIT_BUILD_DIR}/${pkg}"
-    sed -i \
-      "s|git+https://github.com/openzfs/zfs.git|git+https://github.com/openzfs/zfs.git#commit=${OPENZFS_GIT_REF}|" \
-      "${ZFS_GIT_BUILD_DIR}/${pkg}/PKGBUILD"
-    chown -R "${ZFS_GIT_BUILD_USER}:${ZFS_GIT_BUILD_USER}" "${ZFS_GIT_BUILD_DIR}/${pkg}"
-  done
-
-  # Build utils first — dkms package depends on it.
-  sudo -u "$ZFS_GIT_BUILD_USER" bash -lc \
-    "cd '${ZFS_GIT_BUILD_DIR}/zfs-utils-git' && MAKEFLAGS='-j$(nproc)' makepkg --noconfirm --syncdeps --needed"
-  pacman -U --noconfirm "${ZFS_GIT_BUILD_DIR}"/zfs-utils-git/zfs-utils-git-[0-9]*.pkg.tar.zst
-
-  sudo -u "$ZFS_GIT_BUILD_USER" bash -lc \
-    "cd '${ZFS_GIT_BUILD_DIR}/zfs-dkms-git' && MAKEFLAGS='-j$(nproc)' makepkg --noconfirm --syncdeps --needed"
-  pacman -U --noconfirm "${ZFS_GIT_BUILD_DIR}"/zfs-dkms-git/zfs-dkms-git-[0-9]*.pkg.tar.zst
-
-  # Stash the built packages so stage_pacstrap can install them in the chroot
-  # without rebuilding (DKMS will rebuild against the chroot's kernel headers).
-  cp "${ZFS_GIT_BUILD_DIR}"/zfs-utils-git/zfs-utils-git-[0-9]*.pkg.tar.zst "$ZFS_GIT_PKG_DIR/"
-  cp "${ZFS_GIT_BUILD_DIR}"/zfs-dkms-git/zfs-dkms-git-[0-9]*.pkg.tar.zst "$ZFS_GIT_PKG_DIR/"
-
-  modprobe zfs
-  command -v zpool &>/dev/null || die "ZFS install succeeded but zpool not on PATH"
+  say "ZFS available on this ISO"
+  run modprobe zfs
 }
 
 # ============================================================================
@@ -500,28 +458,34 @@ stage_mount_filesystems() {
 }
 
 # ============================================================================
-# Stage 10: pacstrap base + zfs (using the pre-built git packages)
+# Stage 10: pacstrap base + LTS kernel + prebuilt zfs-linux-lts
+#
+# The archzfs LTS ISO ships archzfs configured. pacstrap with -C carries
+# the ISO's pacman.conf into the chroot, so archzfs is reachable for
+# `linux-lts` + `zfs-linux-lts` install (atomically version-paired by
+# archzfs's own packaging) and remains configured for future updates.
 # ============================================================================
 
 stage_pacstrap() {
-  say "pacstrap (≈5 min)"
+  say "pacstrap (≈3 min — prebuilt packages, no DKMS build)"
   run pacstrap -K "$MNT" \
-    base base-devel linux linux-firmware linux-headers \
+    base base-devel \
+    linux-lts linux-lts-headers linux-firmware \
     sudo git iwd \
     efibootmgr dosfstools \
-    dkms
+    zfs-linux-lts zfs-utils
 
-  # Install the pre-built zfs-utils-git / zfs-dkms-git packages in the chroot.
-  # DKMS will rebuild the module against the chroot's installed kernel headers.
-  if [[ -d $ZFS_GIT_PKG_DIR ]] && compgen -G "$ZFS_GIT_PKG_DIR/zfs-*.pkg.tar.zst" >/dev/null; then
+  # Mirror the ISO's archzfs repo configuration into the chroot so future
+  # `pacman -Syu` runs there pull paired linux-lts + zfs-linux-lts updates
+  # from archzfs as they're published.
+  if grep -q '^\[archzfs\]' /etc/pacman.conf && ! grep -q '^\[archzfs\]' "$MNT/etc/pacman.conf"; then
     if (( DRY_RUN )); then
-      log "would install zfs-utils-git and zfs-dkms-git in chroot from $ZFS_GIT_PKG_DIR"
+      log "would copy archzfs section from /etc/pacman.conf into chroot"
     else
-      install -d "$MNT/var/cache/omarchy/zfs-git-pkgs"
-      cp "$ZFS_GIT_PKG_DIR"/*.pkg.tar.zst "$MNT/var/cache/omarchy/zfs-git-pkgs/"
-      arch-chroot "$MNT" pacman -U --noconfirm \
-        /var/cache/omarchy/zfs-git-pkgs/zfs-utils-git-[0-9]*.pkg.tar.zst \
-        /var/cache/omarchy/zfs-git-pkgs/zfs-dkms-git-[0-9]*.pkg.tar.zst
+      awk '/^\[archzfs\]/,/^\[/{ if (/^\[/ && !/^\[archzfs\]/) exit; print }' /etc/pacman.conf \
+        | sudo tee -a "$MNT/etc/pacman.conf" >/dev/null
+      arch-chroot "$MNT" pacman-key --recv-keys DDF7DB817396A49B2A2723F7403BD972F75D9D76 2>/dev/null || true
+      arch-chroot "$MNT" pacman-key --lsign-key DDF7DB817396A49B2A2723F7403BD972F75D9D76 2>/dev/null || true
     fi
   fi
 }
@@ -753,6 +717,10 @@ Next:
   - ZFSBootMenu shows the encryption passphrase prompt (your $POOL_NAME passphrase)
   - select ${DATASET_ROOT}
   - log in as $USERNAME_VAL with the same passphrase
+
+Kernel + ZFS: linux-lts paired with prebuilt zfs-linux-lts. Future updates
+flow atomically — when archzfs publishes a new linux-lts/zfs-linux-lts
+pair, \`omarchy-update\` (or plain \`pacman -Syu\`) pulls them together.
 
 Branding follow-up (after first boot):
   - install yay (or paru)

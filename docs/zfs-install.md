@@ -170,42 +170,68 @@ zpool create -f \
   -O compression=zstd \
   -O normalization=formD \
   -O relatime=on -O atime=off \
-  -O mountpoint=none \
+  -O mountpoint=none -O canmount=off \
   -O encryption=aes-256-gcm \
   -O keyformat=passphrase \
   -O keylocation=prompt \
-  rpool /dev/nvme0n1p2
+  -R /mnt \
+  zroot /dev/nvme0n1p2
 ```
 
 You'll be prompted for an encryption passphrase during pool creation.
 Remember it -- it unlocks your system at boot.
 
+Pool name is `zroot` (Arch wiki convention). Older fork installs used
+`rpool` (the FreeBSD heritage name); both work — runtime tooling
+discovers the pool name dynamically. New installs default to `zroot`.
+
 ## Step 2: Create the dataset layout
 
-Omarchy expects (but does not require) this dataset layout:
+The fork's bootstrap script creates this layout (matches the
+[Install Arch Linux on ZFS](https://wiki.archlinux.org/title/Install_Arch_Linux_on_ZFS)
+wiki guide):
 
 ```
-rpool/omarchy              (mountpoint=none, canmount=off)   -- container
-rpool/omarchy/root         (mountpoint=/,    canmount=noauto) -- boot env
-rpool/omarchy/varcache     (mountpoint=/var/cache, canmount=noauto)
-rpool/omarchy/varlog       (mountpoint=/var/log,   canmount=noauto)
-rpool/omarchy/home         (mountpoint=/home,      canmount=noauto)
-rpool/keystore             (mountpoint=/etc/zfs/keys) -- optional
+zroot/ROOT                       (container, no mount)
+zroot/ROOT/default               -> /                   (the boot environment)
+zroot/data                       (container)
+zroot/data/home                  -> /home               (shared across BEs)
+zroot/data/root                  -> /root
+zroot/var                        (container)
+zroot/var/log                    -> /var/log
+zroot/var/log/journal            -> /var/log/journal    (posixacl)
+zroot/var/cache                  -> /var/cache
+zroot/var/tmp                    -> /var/tmp
+zroot/var/lib/docker             -> /var/lib/docker     (per-service rollback)
+zroot/var/lib/libvirt            -> /var/lib/libvirt
+zroot/var/lib/machines           -> /var/lib/machines
+zroot/keystore                   -> /etc/zfs/keys       (encryption key)
 ```
 
 Create them:
 
 ```
-zfs create -o mountpoint=none -o canmount=off rpool/omarchy
-zfs create -o mountpoint=/ -o canmount=noauto rpool/omarchy/root
-zfs create -o mountpoint=/var/cache -o canmount=noauto rpool/omarchy/varcache
-zfs create -o mountpoint=/var/log   -o canmount=noauto rpool/omarchy/varlog
-zfs create -o mountpoint=/home      -o canmount=noauto rpool/omarchy/home
+zfs create -o mountpoint=none -o canmount=off zroot/ROOT
+zfs create -o mountpoint=/    -o canmount=noauto zroot/ROOT/default
+zfs create -o mountpoint=none -o canmount=off zroot/data
+zfs create -o mountpoint=/home zroot/data/home
+zfs create -o mountpoint=/root zroot/data/root
+zfs create -o mountpoint=none -o canmount=off zroot/var
+zfs create -o mountpoint=/var/log zroot/var/log
+zfs create -o mountpoint=/var/log/journal -o acltype=posixacl zroot/var/log/journal
+zfs create -o mountpoint=/var/cache zroot/var/cache
+zfs create -o mountpoint=/var/tmp zroot/var/tmp
+zfs create -o mountpoint=none -o canmount=off zroot/var/lib
+zfs create -o mountpoint=/var/lib/docker   zroot/var/lib/docker
+zfs create -o mountpoint=/var/lib/libvirt  zroot/var/lib/libvirt
+zfs create -o mountpoint=/var/lib/machines zroot/var/lib/machines
+zfs create -o mountpoint=/etc/zfs/keys     zroot/keystore
+zpool set bootfs=zroot/ROOT/default zroot
 ```
 
-Why separate datasets? When you take a snapshot of `rpool/omarchy/root`
-and later roll back, child datasets (varcache, varlog, home) aren't
-affected. That means:
+Why separate datasets? When you take a snapshot of `zroot/ROOT/default`
+and later roll back, child datasets (var/log, var/cache, home, etc.)
+aren't affected. That means:
 
 - System rollback doesn't destroy your pacman cache (saves re-downloads)
 - System rollback doesn't destroy your logs (keeps incident history)

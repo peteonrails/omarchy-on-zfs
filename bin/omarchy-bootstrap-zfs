@@ -16,12 +16,15 @@
 #   omarchy-bootstrap-zfs --dry-run           # print actions, change nothing
 #   omarchy-bootstrap-zfs --resume            # resume from last completed stage
 #
-# Scope (v1):
+# Scope:
 #   - Single disk OR multi-disk (mirror, raidz1, raidz2, raidz3)
 #   - Fresh pool OR import of an existing pool (Appendix A dual-boot)
-#   - Per-BE home OR shared home (rpool/home with canmount=on)
-#   - Encrypted with passphrase, file-based key (for password sync at install)
+#   - Encrypted whole-pool with passphrase, file-based key for password sync
 #   - Single ESP on the first member disk (ESP-mirror is a follow-up)
+#   - Arch-wiki-style dataset layout: zroot/ROOT/default + zroot/data + zroot/var
+#   - zfs-dkms-git built from a pinned OpenZFS commit (avoids the archzfs
+#     release-lag-vs-kernel trap we hit on kernel 7.x). Override the commit
+#     via OMARCHY_OPENZFS_REF.
 
 set -euo pipefail
 
@@ -29,13 +32,23 @@ set -euo pipefail
 # Constants
 # ============================================================================
 
-readonly POOL_NAME="rpool"
-readonly DATASET_OMARCHY="${POOL_NAME}/omarchy"
-readonly DATASET_ROOT="${DATASET_OMARCHY}/root"
-readonly DATASET_VARCACHE="${DATASET_OMARCHY}/varcache"
-readonly DATASET_VARLOG="${DATASET_OMARCHY}/varlog"
-readonly DATASET_HOME_PERBE="${DATASET_OMARCHY}/home"
-readonly DATASET_HOME_SHARED="${POOL_NAME}/home"
+readonly POOL_NAME="zroot"
+# Arch-wiki dataset layout — discoverable by ZBM (ROOT/<be>) and granular
+# enough that snapshot/rollback can target individual subsystems.
+readonly DATASET_ROOT_CONTAINER="${POOL_NAME}/ROOT"
+readonly DATASET_ROOT="${DATASET_ROOT_CONTAINER}/default"
+readonly DATASET_DATA="${POOL_NAME}/data"
+readonly DATASET_HOME="${DATASET_DATA}/home"
+readonly DATASET_USER_ROOT="${DATASET_DATA}/root"
+readonly DATASET_VAR="${POOL_NAME}/var"
+readonly DATASET_VARLOG="${DATASET_VAR}/log"
+readonly DATASET_VARLOG_JOURNAL="${DATASET_VARLOG}/journal"
+readonly DATASET_VARCACHE="${DATASET_VAR}/cache"
+readonly DATASET_VARTMP="${DATASET_VAR}/tmp"
+readonly DATASET_VARLIB="${DATASET_VAR}/lib"
+readonly DATASET_VARLIB_DOCKER="${DATASET_VARLIB}/docker"
+readonly DATASET_VARLIB_LIBVIRT="${DATASET_VARLIB}/libvirt"
+readonly DATASET_VARLIB_MACHINES="${DATASET_VARLIB}/machines"
 readonly DATASET_KEYSTORE="${POOL_NAME}/keystore"
 
 readonly KEYFILE_TMP="/tmp/omarchy-bootstrap.key"
@@ -48,6 +61,15 @@ readonly ARCHZFS_KEY="DDF7DB817396A49B2A2723F7403BD972F75D9D76"
 # Latest stable release EFI, served via redirect by the ZBM project.
 readonly ZBM_RELEASE_URL="https://get.zfsbootmenu.org/efi"
 
+# Pin OpenZFS to a specific master-branch commit when building zfs-dkms-git.
+# Override via OMARCHY_OPENZFS_REF=<sha> if a newer commit is needed before
+# we cut the next bootstrap release. Default commit is on master with
+# Linux-Maximum: 7.0 — avoids the "archzfs release lags new kernel" trap.
+readonly OPENZFS_GIT_REF="${OMARCHY_OPENZFS_REF:-0a59f7845c2863b5370bfa38e4d397ba3d73b62a}"
+readonly ZFS_GIT_BUILD_DIR="/tmp/omarchy-zfs-git-build"
+readonly ZFS_GIT_PKG_DIR="/tmp/omarchy-zfs-git-pkgs"
+readonly ZFS_GIT_BUILD_USER="omarchy-zfs-build"
+
 readonly MNT="/mnt"
 readonly ESP_MOUNT="${MNT}/boot/efi"
 
@@ -58,7 +80,6 @@ readonly ESP_MOUNT="${MNT}/boot/efi"
 DRY_RUN=0
 RESUME=0
 USE_EXISTING_POOL=0
-HOME_STRATEGY=""
 TARGET_DISKS=()
 POOL_TOPOLOGY=""
 ESP_DEVICE=""
@@ -152,7 +173,17 @@ stage_preflight() {
 }
 
 # ============================================================================
-# Stage 2: install ZFS on the live ISO via archzfs
+# Stage 2: build zfs-dkms-git / zfs-utils-git from a pinned OpenZFS commit
+#
+# We pin instead of pulling archzfs's released zfs-dkms because archzfs lags
+# OpenZFS upstream by weeks-to-months — and OpenZFS master may have
+# Linux-Maximum support for kernel versions that the released archzfs
+# package doesn't yet build against. Using the git PKGBUILD with a pinned
+# upstream commit gets us the support we need without depending on the
+# archzfs release cadence.
+#
+# Built packages also get carried into the chroot via stage_pacstrap so the
+# target system has the same versions.
 # ============================================================================
 
 stage_install_zfs_on_iso() {
@@ -162,23 +193,52 @@ stage_install_zfs_on_iso() {
     return 0
   fi
 
-  say "Adding archzfs repo and installing zfs-dkms (this can take 5+ min)"
-
-  if ! grep -q '^\[archzfs\]' /etc/pacman.conf; then
-    run pacman-key --recv-keys "$ARCHZFS_KEY"
-    run pacman-key --lsign-key "$ARCHZFS_KEY"
-    {
-      echo ''
-      echo '[archzfs]'
-      echo 'Server = https://archzfs.com/$repo/$arch'
-    } | run tee -a /etc/pacman.conf >/dev/null
-  fi
+  say "Building zfs-utils-git and zfs-dkms-git from OpenZFS @ $OPENZFS_GIT_REF"
+  say "(this takes ~5–10 min the first time; pinned commit avoids archzfs lag)"
 
   run pacman -Sy --noconfirm
-  run pacman -S --noconfirm --needed base-devel linux-headers
-  run pacman -S --noconfirm --needed zfs-dkms zfs-utils
+  run pacman -S --noconfirm --needed base-devel git linux-headers dkms
 
-  run modprobe zfs
+  if (( DRY_RUN )); then
+    log "would clone, sed-pin, and makepkg zfs-{utils,dkms}-git"
+    return 0
+  fi
+
+  rm -rf "$ZFS_GIT_BUILD_DIR" "$ZFS_GIT_PKG_DIR"
+  mkdir -p "$ZFS_GIT_BUILD_DIR" "$ZFS_GIT_PKG_DIR"
+
+  if ! id -u "$ZFS_GIT_BUILD_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$ZFS_GIT_BUILD_USER"
+  fi
+  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$ZFS_GIT_BUILD_USER" \
+    > "/etc/sudoers.d/${ZFS_GIT_BUILD_USER}"
+  chmod 440 "/etc/sudoers.d/${ZFS_GIT_BUILD_USER}"
+  chown -R "${ZFS_GIT_BUILD_USER}:${ZFS_GIT_BUILD_USER}" "$ZFS_GIT_BUILD_DIR"
+
+  for pkg in zfs-utils-git zfs-dkms-git; do
+    sudo -u "$ZFS_GIT_BUILD_USER" git clone --depth 1 \
+      "https://aur.archlinux.org/${pkg}.git" "${ZFS_GIT_BUILD_DIR}/${pkg}"
+    sed -i \
+      "s|git+https://github.com/openzfs/zfs.git|git+https://github.com/openzfs/zfs.git#commit=${OPENZFS_GIT_REF}|" \
+      "${ZFS_GIT_BUILD_DIR}/${pkg}/PKGBUILD"
+    chown -R "${ZFS_GIT_BUILD_USER}:${ZFS_GIT_BUILD_USER}" "${ZFS_GIT_BUILD_DIR}/${pkg}"
+  done
+
+  # Build utils first — dkms package depends on it.
+  sudo -u "$ZFS_GIT_BUILD_USER" bash -lc \
+    "cd '${ZFS_GIT_BUILD_DIR}/zfs-utils-git' && MAKEFLAGS='-j$(nproc)' makepkg --noconfirm --syncdeps --needed"
+  pacman -U --noconfirm "${ZFS_GIT_BUILD_DIR}"/zfs-utils-git/zfs-utils-git-[0-9]*.pkg.tar.zst
+
+  sudo -u "$ZFS_GIT_BUILD_USER" bash -lc \
+    "cd '${ZFS_GIT_BUILD_DIR}/zfs-dkms-git' && MAKEFLAGS='-j$(nproc)' makepkg --noconfirm --syncdeps --needed"
+  pacman -U --noconfirm "${ZFS_GIT_BUILD_DIR}"/zfs-dkms-git/zfs-dkms-git-[0-9]*.pkg.tar.zst
+
+  # Stash the built packages so stage_pacstrap can install them in the chroot
+  # without rebuilding (DKMS will rebuild against the chroot's kernel headers).
+  cp "${ZFS_GIT_BUILD_DIR}"/zfs-utils-git/zfs-utils-git-[0-9]*.pkg.tar.zst "$ZFS_GIT_PKG_DIR/"
+  cp "${ZFS_GIT_BUILD_DIR}"/zfs-dkms-git/zfs-dkms-git-[0-9]*.pkg.tar.zst "$ZFS_GIT_PKG_DIR/"
+
+  modprobe zfs
   command -v zpool &>/dev/null || die "ZFS install succeeded but zpool not on PATH"
 }
 
@@ -318,6 +378,9 @@ stage_create_pool() {
   esac
 
   say "Creating pool $POOL_NAME ($POOL_TOPOLOGY)"
+  # -R /mnt sets the altroot so child datasets mount under /mnt without
+  # rewriting their mountpoint properties. After reboot, no altroot is
+  # active and the same datasets mount at their literal mountpoints.
   # shellcheck disable=SC2086
   run zpool create -f \
     -o ashift=12 \
@@ -327,9 +390,11 @@ stage_create_pool() {
     -O normalization=formD \
     -O relatime=on -O atime=off \
     -O mountpoint=none \
+    -O canmount=off \
     -O encryption=aes-256-gcm \
     -O keyformat=passphrase \
     -O keylocation="file://$KEYFILE_TMP" \
+    -R "$MNT" \
     "$POOL_NAME" $vdev_spec
 }
 
@@ -352,8 +417,8 @@ stage_import_existing_pool() {
     fi
   fi
 
-  if zfs list -H -o name | grep -qx "$DATASET_OMARCHY"; then
-    die "$DATASET_OMARCHY already exists. Refusing to clobber."
+  if zfs list -H -o name | grep -qx "$DATASET_ROOT_CONTAINER"; then
+    die "$DATASET_ROOT_CONTAINER already exists. Refusing to clobber."
   fi
 
   # Find the existing ESP — caller's other OS will have one mounted somewhere
@@ -365,43 +430,56 @@ stage_import_existing_pool() {
 }
 
 # ============================================================================
-# Stage 8: dataset layout
+# Stage 8: dataset layout (Arch-wiki-style)
+#
+# Pool root carries the encryption (set in stage_create_pool); all child
+# datasets inherit. Mountpoints are stored in the pool itself so
+# zfs-mount-generator can reconstruct the tree at boot.
+#
+#   zroot/ROOT/default        →  /            (the boot environment)
+#   zroot/data/home           →  /home
+#   zroot/data/root           →  /root
+#   zroot/var/log             →  /var/log
+#   zroot/var/log/journal     →  /var/log/journal   (posixacl for systemd)
+#   zroot/var/cache           →  /var/cache
+#   zroot/var/tmp             →  /var/tmp
+#   zroot/var/lib/{docker,libvirt,machines}        (per-service, opt rollback)
+#   zroot/keystore            →  /etc/zfs/keys
 # ============================================================================
 
 stage_create_datasets() {
-  say "Choose home strategy"
-  HOME_STRATEGY=$(printf '%s\n' \
-    "perbe — rpool/omarchy/home (isolated to this BE)" \
-    "shared — rpool/home (shared across boot environments)" \
-    | gum choose --header "Home dataset")
-  HOME_STRATEGY="${HOME_STRATEGY%% *}"
-  [[ $HOME_STRATEGY =~ ^(perbe|shared)$ ]] || die "Bad home strategy: $HOME_STRATEGY"
+  # Container datasets (no mount, no children inherit a mountpoint)
+  run zfs create -o mountpoint=none -o canmount=off "$DATASET_ROOT_CONTAINER"
+  run zfs create -o mountpoint=none -o canmount=off "$DATASET_DATA"
+  run zfs create -o mountpoint=none -o canmount=off "$DATASET_VAR"
+  run zfs create -o mountpoint=none -o canmount=off "$DATASET_VARLIB"
 
-  run zfs create -o mountpoint=none -o canmount=off "$DATASET_OMARCHY"
+  # Boot environment — ZBM expects <pool>/ROOT/<name> with mountpoint=/ +
+  # canmount=noauto. The "default" suffix is the BE name.
   run zfs create -o mountpoint=/ -o canmount=noauto "$DATASET_ROOT"
-  run zfs create -o mountpoint=/var/cache -o canmount=noauto "$DATASET_VARCACHE"
-  run zfs create -o mountpoint=/var/log   -o canmount=noauto "$DATASET_VARLOG"
 
-  case "$HOME_STRATEGY" in
-    perbe)
-      run zfs create -o mountpoint=/home -o canmount=noauto "$DATASET_HOME_PERBE"
-      ;;
-    shared)
-      if zfs list -H -o name | grep -qx "$DATASET_HOME_SHARED"; then
-        say "Shared $DATASET_HOME_SHARED already exists — leaving it alone"
-      else
-        run zfs create -o mountpoint=/home -o canmount=on "$DATASET_HOME_SHARED"
-      fi
-      if (( USE_EXISTING_POOL )); then
-        # Other OS may use zfs-mount.service; keep them out of each other's way
-        run zfs set org.openzfs.systemd:ignore=on "$DATASET_HOME_SHARED"
-      fi
-      ;;
-  esac
+  # User-data datasets (shared across boot environments by default)
+  run zfs create -o mountpoint=/home "$DATASET_HOME"
+  run zfs create -o mountpoint=/root "$DATASET_USER_ROOT"
 
+  # /var subtree — separate datasets so a system rollback doesn't nuke
+  # logs / pacman cache, and per-service rollback is possible.
+  run zfs create -o mountpoint=/var/log "$DATASET_VARLOG"
+  run zfs create -o mountpoint=/var/log/journal -o acltype=posixacl "$DATASET_VARLOG_JOURNAL"
+  run zfs create -o mountpoint=/var/cache "$DATASET_VARCACHE"
+  run zfs create -o mountpoint=/var/tmp "$DATASET_VARTMP"
+  run zfs create -o mountpoint=/var/lib/docker "$DATASET_VARLIB_DOCKER"
+  run zfs create -o mountpoint=/var/lib/libvirt "$DATASET_VARLIB_LIBVIRT"
+  run zfs create -o mountpoint=/var/lib/machines "$DATASET_VARLIB_MACHINES"
+
+  # Encryption key storage — mounted at /etc/zfs/keys so the keyfile is
+  # available post-import for the password-sync logic in install.sh.
   if ! zfs list -H -o name | grep -qx "$DATASET_KEYSTORE"; then
-    run zfs create -o mountpoint=/etc/zfs/keys -o canmount=noauto "$DATASET_KEYSTORE"
+    run zfs create -o mountpoint=/etc/zfs/keys "$DATASET_KEYSTORE"
   fi
+
+  # Pool-level boot pointer for ZBM convenience.
+  run zpool set "bootfs=$DATASET_ROOT" "$POOL_NAME"
 }
 
 # ============================================================================
@@ -412,22 +490,17 @@ stage_mount_filesystems() {
   run mkdir -p "$MNT"
   run mount -t zfs -o zfsutil "$DATASET_ROOT" "$MNT"
 
-  run mkdir -p "$MNT/var/cache" "$MNT/var/log" "$MNT/home" "$MNT/etc/zfs/keys"
-  run mount -t zfs -o zfsutil "$DATASET_VARCACHE" "$MNT/var/cache"
-  run mount -t zfs -o zfsutil "$DATASET_VARLOG"   "$MNT/var/log"
+  # Mount everything else by letting ZFS resolve mountpoints relative to /mnt
+  # via altroot. zpool was created with -R /mnt in stage_create_pool, so
+  # `zfs mount -a` mounts each dataset at "$MNT/<mountpoint>".
+  run zfs mount -a
 
-  case "$HOME_STRATEGY" in
-    perbe)  run mount -t zfs -o zfsutil "$DATASET_HOME_PERBE" "$MNT/home" ;;
-    shared) run mount -t zfs -o zfsutil "$DATASET_HOME_SHARED" "$MNT/home" ;;
-  esac
-
-  run mount -t zfs -o zfsutil "$DATASET_KEYSTORE" "$MNT/etc/zfs/keys"
   run mkdir -p "$ESP_MOUNT"
   run mount "$ESP_DEVICE" "$ESP_MOUNT"
 }
 
 # ============================================================================
-# Stage 10: pacstrap base + zfs
+# Stage 10: pacstrap base + zfs (using the pre-built git packages)
 # ============================================================================
 
 stage_pacstrap() {
@@ -436,18 +509,20 @@ stage_pacstrap() {
     base base-devel linux linux-firmware linux-headers \
     sudo git iwd \
     efibootmgr dosfstools \
-    zfs-utils zfs-dkms
+    dkms
 
-  # Mirror the archzfs repo config into the chroot so zfs-dkms updates work
-  if grep -q '^\[archzfs\]' /etc/pacman.conf && ! grep -q '^\[archzfs\]' "$MNT/etc/pacman.conf"; then
-    {
-      echo ''
-      echo '[archzfs]'
-      echo 'Server = https://archzfs.com/$repo/$arch'
-    } | run tee -a "$MNT/etc/pacman.conf" >/dev/null
-    run cp /etc/pacman.d/gnupg/pubring.gpg "$MNT/etc/pacman.d/gnupg/" 2>/dev/null || true
-    run arch-chroot "$MNT" pacman-key --recv-keys "$ARCHZFS_KEY"
-    run arch-chroot "$MNT" pacman-key --lsign-key "$ARCHZFS_KEY"
+  # Install the pre-built zfs-utils-git / zfs-dkms-git packages in the chroot.
+  # DKMS will rebuild the module against the chroot's installed kernel headers.
+  if [[ -d $ZFS_GIT_PKG_DIR ]] && compgen -G "$ZFS_GIT_PKG_DIR/zfs-*.pkg.tar.zst" >/dev/null; then
+    if (( DRY_RUN )); then
+      log "would install zfs-utils-git and zfs-dkms-git in chroot from $ZFS_GIT_PKG_DIR"
+    else
+      install -d "$MNT/var/cache/omarchy/zfs-git-pkgs"
+      cp "$ZFS_GIT_PKG_DIR"/*.pkg.tar.zst "$MNT/var/cache/omarchy/zfs-git-pkgs/"
+      arch-chroot "$MNT" pacman -U --noconfirm \
+        /var/cache/omarchy/zfs-git-pkgs/zfs-utils-git-[0-9]*.pkg.tar.zst \
+        /var/cache/omarchy/zfs-git-pkgs/zfs-dkms-git-[0-9]*.pkg.tar.zst
+    fi
   fi
 }
 
@@ -461,27 +536,11 @@ stage_fstab() {
     return 0
   fi
 
-  genfstab -U "$MNT" >> "$MNT/etc/fstab"
-
-  cat >> "$MNT/etc/fstab" <<EOF
-
-# ZFS datasets (canmount=noauto requires explicit mount entries)
-${DATASET_VARCACHE}  /var/cache  zfs  defaults,zfsutil  0 0
-${DATASET_VARLOG}    /var/log    zfs  defaults,zfsutil  0 0
-EOF
-
-  case "$HOME_STRATEGY" in
-    perbe)
-      echo "${DATASET_HOME_PERBE}     /home       zfs  defaults,zfsutil  0 0" >> "$MNT/etc/fstab"
-      ;;
-    shared)
-      # canmount=on lets zfs-mount-generator handle it from zfs-list.cache;
-      # don't add an fstab entry to avoid double-mount conflicts.
-      :
-      ;;
-  esac
-
-  echo "${DATASET_KEYSTORE}    /etc/zfs/keys  zfs  defaults,zfsutil  0 0" >> "$MNT/etc/fstab"
+  # genfstab captures the ESP. ZFS datasets are intentionally NOT in fstab —
+  # zfs-mount-generator (driven by zfs-zed + the cachefile) handles them at
+  # boot, and double-mount conflicts are easy to introduce by mixing fstab
+  # entries with zfs-mount-generator-managed mounts.
+  genfstab -U "$MNT" | grep -v ' zfs ' >> "$MNT/etc/fstab"
 }
 
 # ============================================================================
@@ -555,7 +614,7 @@ EOF
     chmod 440 "$MNT/etc/sudoers.d/wheel"
   fi
 
-  say "Persisting key into rpool/keystore and switching to file-based keylocation"
+  say "Persisting key into ${DATASET_KEYSTORE} and switching to file-based keylocation"
   if ! (( DRY_RUN )); then
     install -m 600 "$KEYFILE_TMP" "$MNT$KEYFILE_FINAL"
     # Run change-key inside the chroot so the file:// path resolves correctly.
@@ -692,7 +751,7 @@ stage_finalize() {
 Next:
   - reboot
   - ZFSBootMenu shows the encryption passphrase prompt (your $POOL_NAME passphrase)
-  - select rpool/omarchy/root
+  - select ${DATASET_ROOT}
   - log in as $USERNAME_VAL with the same passphrase
 
 Branding follow-up (after first boot):
